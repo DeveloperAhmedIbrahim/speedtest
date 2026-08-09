@@ -16,7 +16,11 @@
  */
 
 export const DEFAULTS = {
-  // Base URL of the LibreSpeed `server` folder. Relative is fine.
+  // 'librespeed' → empty.php / garbage.php / getIP.php
+  // 'worker'     → /ping /down /up /ip  (the Cloudflare Worker in ../worker)
+  backend: 'librespeed',
+
+  // Base URL of the backend. Relative is fine for librespeed.
   baseUrl: '/server',
 
   // Optional: spread streams across several origins, e.g.
@@ -142,6 +146,17 @@ export class SpeedTest {
     this.ulBlob = null;
   }
 
+  /** Endpoint filename for the configured backend. */
+  endpoint(kind) {
+    const worker = this.cfg.backend === 'worker';
+    return {
+      ping: worker ? 'ping' : 'empty.php',
+      upload: worker ? 'up' : 'empty.php',
+      download: worker ? 'down' : 'garbage.php',
+      info: worker ? 'ip' : 'getIP.php',
+    }[kind];
+  }
+
   url(file, params = {}, streamIndex = 0) {
     const pool = this.cfg.hosts?.length ? this.cfg.hosts : [this.cfg.baseUrl];
     const base = pool[streamIndex % pool.length].replace(/\/+$/, '');
@@ -159,9 +174,15 @@ export class SpeedTest {
 
   /* ---------------- connection info ---------------- */
 
+  infoUrl() {
+    return this.cfg.backend === 'worker'
+      ? this.url('ip')
+      : this.url('getIP.php', { isp: 'true' });
+  }
+
   async getInfo() {
     try {
-      const res = await fetch(this.url('getIP.php', { isp: 'true' }), { cache: 'no-store' });
+      const res = await fetch(this.infoUrl(), { cache: 'no-store' });
       const data = await res.json();
       return typeof data === 'string' ? { processedString: data } : data;
     } catch {
@@ -179,12 +200,20 @@ export class SpeedTest {
   async diagnose() {
     const out = [];
     const line = (name, ok, detail) => out.push({ name, ok, detail });
+    const PING = this.endpoint('ping');
+    const DOWN = this.endpoint('download');
+    const UP = this.endpoint('upload');
+    const INFO = this.endpoint('info');
+    const sizeParam = (mb) => (this.cfg.backend === 'worker'
+      ? { bytes: String(mb * 1048576) }
+      : { ckSize: String(mb) });
+    const sizeLabel = (mb) => `${DOWN} @ ${mb}MB`;
 
     // 0. Which HTTP version did we get? Over h2/h3 every request to one origin
     //    shares a single TCP connection, so parallel streams stop scaling and a
     //    high-latency link stays window-limited no matter how many you open.
     try {
-      const u = this.url('empty.php');
+      const u = this.url(PING);
       await fetch(u, { cache: 'no-store' });
       const entry = performance.getEntriesByName(abs(u)).pop();
       const proto = entry?.nextHopProtocol || 'unknown';
@@ -197,29 +226,29 @@ export class SpeedTest {
       line('http protocol', false, 'could not be determined');
     }
 
-    // 1. getIP.php
+    // 1. connection info
     try {
       const t = performance.now();
-      const res = await fetch(this.url('getIP.php', { isp: 'true' }), { cache: 'no-store' });
-      line('getIP.php', res.ok, `HTTP ${res.status} in ${Math.round(performance.now() - t)}ms`);
+      const res = await fetch(this.infoUrl(), { cache: 'no-store' });
+      line(INFO, res.ok, `HTTP ${res.status} in ${Math.round(performance.now() - t)}ms`);
     } catch (e) {
-      line('getIP.php', false, e?.message || 'request failed');
+      line(INFO, false, e?.message || 'request failed');
     }
 
-    // 2. empty.php, GET — this is the latency endpoint
+    // 2. the latency endpoint
     try {
       const t = performance.now();
-      const res = await fetch(this.url('empty.php'), { cache: 'no-store' });
-      line('empty.php (GET)', res.ok, `HTTP ${res.status}, round trip ${Math.round(performance.now() - t)}ms`);
+      const res = await fetch(this.url(PING), { cache: 'no-store' });
+      line(`${PING} (GET)`, res.ok, `HTTP ${res.status}, round trip ${Math.round(performance.now() - t)}ms`);
     } catch (e) {
-      line('empty.php (GET)', false, e?.message || 'request failed');
+      line(`${PING} (GET)`, false, e?.message || 'request failed');
     }
 
-    // 3. empty.php, POST — the upload path, at the size the test actually uses
+    // 3. the upload path, at the size the test actually uses
     try {
       const blob = this.makeBlob();  // uses the current ulBlobMB
       const t = performance.now();
-      const res = await fetch(this.url('empty.php'), {
+      const res = await fetch(this.url(UP), {
         method: 'POST',
         body: blob,
         headers: { 'Content-Type': 'application/octet-stream' },
@@ -227,17 +256,17 @@ export class SpeedTest {
       const ms = performance.now() - t;
       const mbps = (this.ulBlobMB * 1048576 * 8) / (ms / 1000) / 1e6;
       line(
-        `empty.php (POST ${this.ulBlobMB}MB)`,
+        `${UP} (POST ${this.ulBlobMB}MB)`,
         res.ok,
         res.ok
           ? `HTTP ${res.status} in ${Math.round(ms)}ms (~${mbps.toFixed(1)} Mbps single stream)`
           : `HTTP ${res.status} — body limit is below ${this.ulBlobMB}MB (post_max_size / client_max_body_size / LimitRequestBody)`,
       );
     } catch (e) {
-      line('empty.php (POST)', false, e?.message || 'request failed');
+      line(`${UP} (POST)`, false, e?.message || 'request failed');
     }
 
-    // 4. garbage.php — climb the ladder until the host stops streaming, so you
+    // 4. climb the ladder until the host stops streaming, so you
     //    can see exactly how large a chunk it will actually ship.
     for (const mb of [4, 8, 16, 32, 64]) {
       const controller = new AbortController();
@@ -247,13 +276,13 @@ export class SpeedTest {
       let firstByteAt = null;
       try {
         const t = performance.now();
-        const res = await fetch(this.url('garbage.php', { ckSize: String(mb) }), {
+        const res = await fetch(this.url(DOWN, sizeParam(mb)), {
           cache: 'no-store',
           signal: controller.signal,
         });
         clearTimeout(ttfb);
         if (!res.ok) {
-          line(`garbage.php?ckSize=${mb}`, false, `HTTP ${res.status}`);
+          line(sizeLabel(mb), false, `HTTP ${res.status}`);
           break;
         }
         const reader = res.body.getReader();
@@ -269,13 +298,13 @@ export class SpeedTest {
           }
         }
         const ms = performance.now() - t;
-        line(`garbage.php?ckSize=${mb}`, bytes > 0,
+        line(sizeLabel(mb), bytes > 0,
           `first byte in ${Math.round(firstByteAt ?? ms)}ms, `
           + `${(bytes / 1048576).toFixed(1)}MB in ${Math.round(ms)}ms `
           + `(~${((bytes * 8) / (ms / 1000) / 1e6).toFixed(1)} Mbps single stream)`);
       } catch (e) {
         clearTimeout(ttfb);
-        line(`garbage.php?ckSize=${mb}`, false, ttfbExpired
+        line(sizeLabel(mb), false, ttfbExpired
           ? 'no first byte within 5s — the host buffers this size instead of streaming it. '
             + `Set dlChunkMB below ${mb}.`
           : e?.message || 'request failed');
@@ -325,7 +354,7 @@ export class SpeedTest {
         const c = new AbortController();
         ctrls.push(c);
         try {
-          const res = await fetch(this.url('garbage.php', { ckSize: String(this.cfg.dlChunkMB) }), {
+          const res = await fetch(this.dlUrl(), {
             cache: 'no-store',
             signal: c.signal,
           });
@@ -372,7 +401,7 @@ export class SpeedTest {
 
   measureOne() {
     return new Promise((resolve, reject) => {
-      const url = this.url('empty.php');
+      const url = this.url(this.endpoint('ping'));
       const full = abs(url);
       const xhr = new XMLHttpRequest();
       this.xhrs.push(xhr);
@@ -454,6 +483,9 @@ export class SpeedTest {
       const sep = this.cfg.dlStaticUrl.includes('?') ? '&' : '?';
       return `${this.cfg.dlStaticUrl}${sep}r=${rnd()}`;
     }
+    if (this.cfg.backend === 'worker') {
+      return this.url('down', { bytes: String(this.dlChunk * 1048576) }, streamIndex);
+    }
     return this.url('garbage.php', { ckSize: String(this.dlChunk) }, streamIndex);
   }
 
@@ -478,7 +510,7 @@ export class SpeedTest {
         });
         clearTimeout(ttfbTimer);
 
-        if (!res.ok) throw new Error(`garbage.php answered HTTP ${res.status}`);
+        if (!res.ok) throw new Error(`${this.endpoint('download')} answered HTTP ${res.status}`);
         if (!res.body) throw new Error('This browser did not give a readable response body.');
 
         const reader = res.body.getReader();
@@ -501,12 +533,12 @@ export class SpeedTest {
           const next = Math.max(this.cfg.dlChunkMinMB, Math.floor(askedFor / 2));
           if (next < askedFor) {
             this.dlChunk = next;
-            this.lastError = `garbage.php did not start sending ${askedFor}MB within `
+            this.lastError = `${this.endpoint('download')} did not start sending ${askedFor}MB within `
               + `${(this.cfg.ttfbTimeout / 1000).toFixed(0)}s, so the chunk was reduced to ${next}MB. `
               + `The host is buffering the response instead of streaming it.`;
             continue;
           }
-          this.lastError = `garbage.php did not start sending even ${askedFor}MB within `
+          this.lastError = `${this.endpoint('download')} did not start sending even ${askedFor}MB within `
             + `${(this.cfg.ttfbTimeout / 1000).toFixed(0)}s.`;
         } else if (err?.name === 'AbortError') {
           return;
@@ -540,7 +572,7 @@ export class SpeedTest {
       this.xhrs.push(xhr);
       let sent = 0;
 
-      xhr.open('POST', this.url('empty.php', {}, streamIndex), true);
+      xhr.open('POST', this.url(this.endpoint('upload'), {}, streamIndex), true);
       xhr.setRequestHeader('Content-Type', 'application/octet-stream');
 
       // THE FIX: e.loaded is cumulative for this request. Count the delta.
@@ -556,13 +588,13 @@ export class SpeedTest {
           if (next < this.ulBlobMB) {
             this.ulBlobMB = next;
             this.ulBlob = this.makeBlob(next);
-            this.lastError = `empty.php returned 413, so the upload block was reduced `
+            this.lastError = `${this.endpoint('upload')} returned 413, so the upload block was reduced `
               + `to ${next}MB. Raise post_max_size to use larger blocks.`;
           } else {
-            this.lastError = `empty.php returned 413 even for ${this.ulBlobMB}MB.`;
+            this.lastError = `${this.endpoint('upload')} returned 413 even for ${this.ulBlobMB}MB.`;
           }
         } else if (xhr.status >= 400) {
-          this.lastError = `empty.php rejected the upload with HTTP ${xhr.status}`;
+          this.lastError = `${this.endpoint('upload')} rejected the upload with HTTP ${xhr.status}`;
         }
         send();
       };

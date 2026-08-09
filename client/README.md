@@ -23,6 +23,50 @@ reuse it anywhere.
 
 ---
 
+## 1b. Two backends
+
+The client speaks to either backend; `backend` in `CONFIG` (`src/App.jsx`) picks
+which.
+
+| | `librespeed` | `worker` |
+|---|---|---|
+| Files | `server/*.php` on your host | `worker/` deployed to Cloudflare |
+| Locations | wherever your hosting is | every Cloudflare city |
+| Endpoints | `empty.php` `garbage.php` `getIP.php` | `/ping` `/down` `/up` `/ip` |
+| Cost | your existing hosting | free tier covers normal use |
+
+The Worker exists to solve one specific problem: a single server is close to some
+of your users and far from the rest. A user in Karachi hitting a Karachi edge and
+a user in Dubai hitting a Dubai edge is not something any client-side library can
+arrange — it needs a backend in both places, which is exactly what deploying to
+Cloudflare gives you for free.
+
+Deploy it:
+
+```bash
+cd worker
+npm install
+npx wrangler login
+npx wrangler deploy
+```
+
+Then in `client/.env`:
+
+```
+VITE_SPEEDTEST_BACKEND=worker
+VITE_SPEEDTEST_URL=https://speedtest-backend.<your-subdomain>.workers.dev
+```
+
+The connection line at the top will start showing which edge answered
+(`… · edge KHI`), which is a quick confirmation that users are being served
+locally. `worker/README.md` has the limits worth knowing.
+
+**What changes about the measurement:** you are now measuring the line to the
+nearest Cloudflare edge rather than to your own server. For a speed test that is
+the right target — the question is how fast the user's connection is, not how far
+away your hosting is. If you specifically want to measure *your server*, keep the
+PHP backend.
+
 ## 2. Install
 
 ```bash

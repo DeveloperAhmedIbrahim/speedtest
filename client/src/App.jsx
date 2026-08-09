@@ -6,7 +6,11 @@ import { DEFAULTS, SpeedTest, fmtMs, fmtSpeed } from './lib/speedtest';
 
 const CONFIG = {
   ...DEFAULTS,
+  // 'librespeed' (php files) or 'worker' (the Cloudflare Worker in ../worker)
+  backend: import.meta.env.VITE_SPEEDTEST_BACKEND || 'librespeed',
+
   // Set VITE_SPEEDTEST_URL in .env, e.g. https://speedtest.example.net/server
+  // or https://speedtest-backend.<subdomain>.workers.dev for the worker.
   baseUrl: import.meta.env.VITE_SPEEDTEST_URL || '/server',
 
   // Comma-separated list of extra origins, e.g.
