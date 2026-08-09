@@ -19,6 +19,13 @@ export const DEFAULTS = {
   // Base URL of the LibreSpeed `server` folder. Relative is fine.
   baseUrl: '/server',
 
+  // Optional: spread streams across several origins, e.g.
+  //   ['https://st1.example.net/server', 'https://st2.example.net/server']
+  // Over HTTP/2 the browser multiplexes every request to one origin onto a
+  // SINGLE TCP connection, so parallel streams stop helping. Separate hostnames
+  // force separate connections and restore the benefit. Empty = use baseUrl.
+  hosts: [],
+
   // Optional: serve download bytes from a static file instead of garbage.php
   // (faster + far less CPU on the server). e.g. '/random.dat'
   dlStaticUrl: null,
@@ -27,7 +34,7 @@ export const DEFAULTS = {
   pingTimeout: 5000,
 
   dlStreams: 3,
-  ulStreams: 4,
+  ulStreams: 6,
 
   dlDuration: 15000,
   ulDuration: 15000,
@@ -135,8 +142,9 @@ export class SpeedTest {
     this.ulBlob = null;
   }
 
-  url(file, params = {}) {
-    const base = this.cfg.baseUrl.replace(/\/+$/, '');
+  url(file, params = {}, streamIndex = 0) {
+    const pool = this.cfg.hosts?.length ? this.cfg.hosts : [this.cfg.baseUrl];
+    const base = pool[streamIndex % pool.length].replace(/\/+$/, '');
     const q = new URLSearchParams({ cors: 'true', r: rnd(), ...params });
     return `${base}/${file}?${q}`;
   }
@@ -171,6 +179,23 @@ export class SpeedTest {
   async diagnose() {
     const out = [];
     const line = (name, ok, detail) => out.push({ name, ok, detail });
+
+    // 0. Which HTTP version did we get? Over h2/h3 every request to one origin
+    //    shares a single TCP connection, so parallel streams stop scaling and a
+    //    high-latency link stays window-limited no matter how many you open.
+    try {
+      const u = this.url('empty.php');
+      await fetch(u, { cache: 'no-store' });
+      const entry = performance.getEntriesByName(abs(u)).pop();
+      const proto = entry?.nextHopProtocol || 'unknown';
+      const multiplexed = proto === 'h2' || proto === 'h3';
+      line('http protocol', !multiplexed, multiplexed
+        ? `${proto} — every stream shares ONE TCP connection, so extra streams barely help. `
+          + 'Serve this vhost over HTTP/1.1, or set `hosts` to several subdomains.'
+        : proto);
+    } catch {
+      line('http protocol', false, 'could not be determined');
+    }
 
     // 1. getIP.php
     try {
@@ -424,15 +449,15 @@ export class SpeedTest {
 
   /* ---------------- download ---------------- */
 
-  dlUrl() {
+  dlUrl(streamIndex = 0) {
     if (this.cfg.dlStaticUrl) {
       const sep = this.cfg.dlStaticUrl.includes('?') ? '&' : '?';
       return `${this.cfg.dlStaticUrl}${sep}r=${rnd()}`;
     }
-    return this.url('garbage.php', { ckSize: String(this.dlChunk) });
+    return this.url('garbage.php', { ckSize: String(this.dlChunk) }, streamIndex);
   }
 
-  async downloadStream(meter, endsAt) {
+  async downloadStream(meter, endsAt, streamIndex = 0) {
     while (!this.stopped && performance.now() < endsAt) {
       const askedFor = this.dlChunk;
       const controller = new AbortController();
@@ -447,7 +472,7 @@ export class SpeedTest {
       }, this.cfg.ttfbTimeout);
 
       try {
-        const res = await fetch(this.dlUrl(), {
+        const res = await fetch(this.dlUrl(streamIndex), {
           cache: 'no-store',
           signal: controller.signal,
         });
@@ -507,7 +532,7 @@ export class SpeedTest {
     return new Blob(parts, { type: 'application/octet-stream' });
   }
 
-  uploadStream(meter, endsAt) {
+  uploadStream(meter, endsAt, streamIndex = 0) {
     const send = () => {
       if (this.stopped || performance.now() >= endsAt) return;
 
@@ -515,7 +540,7 @@ export class SpeedTest {
       this.xhrs.push(xhr);
       let sent = 0;
 
-      xhr.open('POST', this.url('empty.php'), true);
+      xhr.open('POST', this.url('empty.php', {}, streamIndex), true);
       xhr.setRequestHeader('Content-Type', 'application/octet-stream');
 
       // THE FIX: e.loaded is cumulative for this request. Count the delta.
@@ -623,7 +648,7 @@ export class SpeedTest {
       for (let i = 0; i < cfg.dlStreams; i++) {
         jobs.push(
           new Promise((resolve) => setTimeout(resolve, i * cfg.streamStagger))
-            .then(() => (this.stopped ? null : this.downloadStream(meter, endsAt)))
+            .then(() => (this.stopped ? null : this.downloadStream(meter, endsAt, i)))
         );
       }
       return jobs;
@@ -635,7 +660,7 @@ export class SpeedTest {
     result.upload = await this.runPhase('upload', cfg.ulDuration, (meter, endsAt) => {
       for (let i = 0; i < cfg.ulStreams; i++) {
         setTimeout(() => {
-          if (!this.stopped) this.uploadStream(meter, endsAt);
+          if (!this.stopped) this.uploadStream(meter, endsAt, i);
         }, i * cfg.streamStagger);
       }
       return [];

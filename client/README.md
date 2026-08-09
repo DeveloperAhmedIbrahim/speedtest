@@ -98,10 +98,31 @@ max_execution_time = 60
 post_max_size = 0
 ```
 
-**Prefer HTTP/1.1 for the speedtest vhost.** Over HTTP/2 the browser multiplexes
-all six streams onto a *single* TCP connection, which is exactly the bottleneck
-the parallel streams exist to avoid. If you must keep h2, expect lower download
-numbers on long-latency or lossy paths.
+**Prefer HTTP/1.1 for the speedtest vhost — this one is not a detail.** Over
+HTTP/2 the browser multiplexes every request to an origin onto a *single* TCP
+connection. That is precisely the bottleneck parallel streams exist to defeat, and
+on a high-latency path a single connection stays window-limited no matter how many
+streams you open. The endpoint check reports the negotiated protocol; if it says
+`h2`, that is very likely your ceiling.
+
+Symptom to recognise: the concurrency probe shows almost no gain from 1 stream to
+6 (e.g. 10.7 → 14.8 Mbps instead of roughly 6x), and single-stream upload sits at
+a suspiciously round fraction of what other tools report.
+
+Two ways out:
+
+1. Serve the speedtest vhost over HTTP/1.1. On a VPS this is one nginx/Apache
+   setting. On shared cPanel you usually cannot change it.
+2. Shard across hostnames. Point several subdomains at the same `server/` folder
+   and list them in `hosts` (or `VITE_SPEEDTEST_HOSTS`). Each origin gets its own
+   TCP connection, which restores real parallelism even under h2:
+
+   ```
+   VITE_SPEEDTEST_HOSTS=https://st1.example.net/server,https://st2.example.net/server,https://st3.example.net/server
+   ```
+
+   The endpoints already send CORS headers when called with `cors=true`, which the
+   client does, so cross-origin works without further changes.
 
 **Sharper ping (optional).** Add one line to `server/empty.php` so the browser
 exposes precise Resource Timing to a cross-origin client:

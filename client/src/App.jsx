@@ -8,6 +8,14 @@ const CONFIG = {
   ...DEFAULTS,
   // Set VITE_SPEEDTEST_URL in .env, e.g. https://speedtest.example.net/server
   baseUrl: import.meta.env.VITE_SPEEDTEST_URL || '/server',
+
+  // Comma-separated list of extra origins, e.g.
+  //   VITE_SPEEDTEST_HOSTS=https://st1.example.net/server,https://st2.example.net/server
+  // Needed to get real parallelism when the server speaks HTTP/2.
+  hosts: (import.meta.env.VITE_SPEEDTEST_HOSTS || '')
+    .split(',')
+    .map((h) => h.trim())
+    .filter(Boolean),
 };
 
 const PENS = {
