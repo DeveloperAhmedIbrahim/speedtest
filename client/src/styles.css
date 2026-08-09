@@ -1,0 +1,373 @@
+/* ------------------------------------------------------------------
+   speedtest — "chart recorder" theme
+   A four-pen plotter on engineering paper: blue pen for download,
+   red for upload, amber for latency, moss for jitter.
+------------------------------------------------------------------ */
+
+:root {
+  color-scheme: light;
+
+  --paper:     #e7eae1;
+  --paper-2:   #f2f4ec;
+  --grid:      #cfd6c6;
+  --rule:      #b3bca6;
+  --ink:       #16211b;
+  --ink-2:     #4a554d;
+
+  --pen-dn:    #12507a;
+  --pen-up:    #a32c1f;
+  --pen-ping:  #9c6a00;
+  --pen-jit:   #4c6b33;
+
+  --font-data: 'Chivo Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+  --font-ui:   'Archivo', system-ui, -apple-system, sans-serif;
+
+  --step: 8px;
+}
+
+* { box-sizing: border-box; }
+
+html, body, #root { height: 100%; }
+
+body {
+  margin: 0;
+  font-family: var(--font-ui);
+  color: var(--ink);
+  background-color: var(--paper);
+  /* the paper itself: 8px engineering grid */
+  background-image:
+    linear-gradient(var(--grid) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid) 1px, transparent 1px);
+  background-size: var(--step) var(--step), var(--step) var(--step);
+  -webkit-font-smoothing: antialiased;
+}
+
+button { font: inherit; color: inherit; }
+
+:focus-visible {
+  outline: 2px solid var(--ink);
+  outline-offset: 2px;
+}
+
+/* ---------- shell ---------- */
+
+.shell {
+  max-width: 660px;
+  margin: 0 auto;
+  padding: 24px 20px 48px;
+}
+
+.rail {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  padding-bottom: 10px;
+  border-bottom: 2px solid var(--ink);
+}
+
+.wordmark {
+  font-family: var(--font-data);
+  font-weight: 700;
+  font-size: 15px;
+  letter-spacing: 0.34em;
+  text-transform: uppercase;
+  margin: 0;
+}
+
+.rail__meta {
+  font-family: var(--font-data);
+  font-size: 10.5px;
+  letter-spacing: 0.1em;
+  color: var(--ink-2);
+  text-align: right;
+  max-width: 58%;
+  overflow-wrap: anywhere;
+}
+
+/* small silkscreen label used all over the panel */
+.tag {
+  font-family: var(--font-data);
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: var(--ink-2);
+}
+
+/* ---------- gauge block ---------- */
+
+.dial {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 14px 0 4px;
+}
+
+.dial__stage { position: relative; }
+
+.dial__canvas { display: block; }
+
+.dial__readout {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  /* nudged down to match the arc centre, which sits below the canvas centre */
+  padding-top: 7%;
+  text-align: center;
+  pointer-events: none;
+}
+
+.dial__value {
+  font-family: var(--font-data);
+  font-weight: 700;
+  font-size: 54px;
+  line-height: 0.92;
+  letter-spacing: -0.03em;
+  font-variant-numeric: tabular-nums;
+  display: block;
+}
+
+.dial__unit {
+  font-family: var(--font-data);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.24em;
+  text-transform: uppercase;
+  display: block;
+  margin-top: 8px;
+}
+
+.dial__phase {
+  font-family: var(--font-data);
+  font-size: 9.5px;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: var(--ink-2);
+  display: block;
+  margin-top: 5px;
+  min-height: 12px;
+}
+
+/* ---------- start control ---------- */
+
+.controls {
+  display: flex;
+  justify-content: center;
+  gap: 10px;
+  margin-top: 4px;
+}
+
+.start {
+  font-family: var(--font-data);
+  font-weight: 700;
+  font-size: 12px;
+  letter-spacing: 0.28em;
+  text-transform: uppercase;
+  padding: 13px 40px;
+  background: var(--ink);
+  color: var(--paper-2);
+  border: 2px solid var(--ink);
+  border-radius: 0;
+  cursor: pointer;
+  transition: transform 120ms ease, box-shadow 120ms ease;
+  box-shadow: 4px 4px 0 var(--rule);
+}
+
+.start:hover:not(:disabled) { transform: translate(-1px, -1px); box-shadow: 5px 5px 0 var(--rule); }
+.start:active:not(:disabled) { transform: translate(2px, 2px); box-shadow: 1px 1px 0 var(--rule); }
+
+.start--ghost {
+  background: transparent;
+  color: var(--ink);
+}
+
+.start:disabled { opacity: 0.4; cursor: default; box-shadow: 4px 4px 0 var(--rule); }
+
+/* ---------- trace / chart recorder ---------- */
+
+.trace {
+  margin-top: 26px;
+  border: 2px solid var(--ink);
+  background: var(--paper-2);
+}
+
+.trace__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--rule);
+}
+
+.trace__pens { display: flex; flex-wrap: wrap; gap: 6px 14px; }
+
+.pen {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--font-data);
+  font-size: 9.5px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--ink-2);
+}
+
+.pen::before {
+  content: '';
+  width: 14px;
+  height: 3px;
+  background: var(--pen);
+}
+
+.trace__canvas { display: block; width: 100%; }
+
+/* ---------- readouts ---------- */
+
+.readouts {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  border: 2px solid var(--ink);
+  border-top: 0;
+  background: var(--paper-2);
+}
+
+.cell {
+  padding: 14px 12px 16px;
+  border-left: 1px solid var(--rule);
+  position: relative;
+}
+
+.cell:first-child { border-left: 0; }
+
+.cell::before {
+  content: '';
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  height: 3px;
+  background: var(--pen);
+}
+
+.cell__value {
+  font-family: var(--font-data);
+  font-weight: 700;
+  font-size: 27px;
+  line-height: 1;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+  display: block;
+  margin-top: 7px;
+}
+
+.cell__unit {
+  font-family: var(--font-data);
+  font-size: 9.5px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--ink-2);
+  margin-left: 4px;
+}
+
+.cell--live .cell__value { color: var(--pen); }
+
+/* ---------- footnote ---------- */
+
+.note {
+  margin-top: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.note__text {
+  font-family: var(--font-data);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  color: var(--ink-2);
+  margin: 0;
+}
+
+.linkish {
+  font-family: var(--font-data);
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  background: none;
+  border: 0;
+  border-bottom: 1.5px solid var(--ink);
+  padding: 2px 0;
+  cursor: pointer;
+}
+
+.alert {
+  margin-top: 18px;
+  border: 2px solid var(--pen-up);
+  background: var(--paper-2);
+  padding: 12px 14px;
+}
+
+.alert p { margin: 4px 0 0; font-size: 13px; line-height: 1.5; }
+
+/* ---------- responsive ---------- */
+
+@media (max-width: 560px) {
+  .shell { padding: 16px 14px 36px; }
+  .wordmark { font-size: 13px; letter-spacing: 0.26em; }
+  .rail { flex-direction: column; align-items: flex-start; gap: 4px; }
+  .rail__meta { text-align: left; max-width: 100%; }
+  .dial__value { font-size: 44px; }
+  .readouts { grid-template-columns: repeat(2, 1fr); }
+  .cell:nth-child(3), .cell:nth-child(4) { border-top: 1px solid var(--rule); }
+  .cell:nth-child(odd) { border-left: 0; }
+  .start { padding: 13px 30px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; animation: none !important; }
+}
+
+/* ---------- endpoint check panel ---------- */
+
+.note__actions { display: inline-flex; gap: 16px; align-items: center; }
+
+.linkish:disabled { opacity: 0.4; cursor: default; }
+
+.checks {
+  margin-top: 14px;
+  border: 2px solid var(--ink);
+  background: var(--paper-2);
+  padding: 12px 14px 14px;
+}
+
+.checks ul { list-style: none; margin: 10px 0 0; padding: 0; }
+
+.checks li {
+  display: grid;
+  grid-template-columns: 42px minmax(0, 210px) 1fr;
+  gap: 10px;
+  align-items: baseline;
+  padding: 6px 0;
+  border-top: 1px solid var(--grid);
+  font-family: var(--font-data);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.checks li:first-child { border-top: 0; }
+
+.checks b { font-size: 9.5px; letter-spacing: 0.12em; }
+.checks li.is-ok b { color: var(--pen-jit); }
+.checks li.is-bad b { color: var(--pen-up); }
+.checks em { font-style: normal; color: var(--ink-2); overflow-wrap: anywhere; }
+
+@media (max-width: 560px) {
+  .checks li { grid-template-columns: 38px 1fr; }
+  .checks em { grid-column: 2; }
+}
