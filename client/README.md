@@ -136,34 +136,74 @@ All knobs are in `DEFAULTS` at the top of `src/lib/speedtest.js`:
 
 ## 6. Troubleshooting: download reads 0.00
 
-Press **Check endpoints** at the bottom of the page. It hits every endpoint and
-prints the status code, so you get a name instead of a guess.
+Press **Check endpoints**. It climbs a ladder of chunk sizes and reports
+time-to-first-byte for each, which is what actually distinguishes the two
+possible failures:
 
-**`garbage.php?ckSize=50` → FAIL, HTTP 500 (but ckSize=4 is OK)**
-PHP is buffering the whole response before sending it, so a large chunk blows
-`memory_limit` and returns 500 with zero bytes. `ini_set('output_buffering','Off')`
-in the stock file cannot fix this, because the buffer is already open by then.
-Copy `server-patched/garbage.php` over `server/garbage.php` — it closes the open
-buffer, drops `Content-Length`, and writes in 256KB blocks, so memory stays flat
-at any size. On cPanel you can also raise `memory_limit` in MultiPHP INI Editor,
-but the patched file is the real fix.
+```
+OK    garbage.php?ckSize=4   first byte in 190ms, 4.0MB in 1234ms (~27.2 Mbps single stream)
+FAIL  garbage.php?ckSize=32  no first byte within 5s — the host buffers this size
+                             instead of streaming it. Set dlChunkMB below 32.
+```
 
-**`empty.php (POST)` → FAIL, HTTP 413**
-The body limit is below `ulBlobMB`. Raise `post_max_size` (MultiPHP INI Editor on
-cPanel) and `LimitRequestBody` / `client_max_body_size`, or lower `ulBlobMB` in
-`src/lib/speedtest.js`. Default is now 2MB, which nearly every host accepts.
+**Small sizes stream, large ones never send a first byte.** The host is holding
+the whole response until PHP finishes generating it, so a big chunk never starts
+arriving inside the phase window and the download reads 0.00. This is normal on
+cPanel, LiteSpeed, and anything with a proxy in front.
 
-**Everything OK but the numbers are still low**
-Look at the single-stream Mbps the check reports for `garbage.php`. That is your
-ceiling for one connection to that particular server, and no client-side change
-raises it.
+The client now handles this on its own: if a request produces no headers within
+`ttfbTimeout` (4s), it halves `dlChunk` for every stream and retries, down to
+`dlChunkMinMB`. So the test degrades to a smaller chunk rather than reporting
+zero. Use the ladder to find the largest size your host will stream and set
+`dlChunkMB` to it — bigger chunks mean less per-request round-trip waste.
+
+`server-patched/garbage.php` fixes the buffering at the source where you control
+PHP: it closes the buffer that is already open (`ini_set` cannot), sends no
+`Content-Length`, and writes 256KB blocks. On some shared hosts a proxy still
+buffers regardless, which is why the client-side fallback exists too.
+
+**`garbage.php?ckSize=4` → HTTP 500** means memory, not buffering: raise
+`memory_limit` in cPanel's MultiPHP INI Editor.
+
+**Everything OK but download is far below what a single stream can do.** The
+check also probes 1, 2, 4 and 6 parallel streams and prints the aggregate for
+each. On a real server the number climbs with the stream count. On a shared host
+that queues PHP processes it goes *down*, and the last line tells you so:
+
+```
+1 parallel stream      22.9 Mbps aggregate
+2 parallel streams     14.1 Mbps aggregate
+6 parallel streams      6.4 Mbps aggregate
+best concurrency       1 stream — extra streams do not help here, the server
+                       queues them. Keep dlStreams low.
+```
+
+Set `dlStreams` in `src/lib/speedtest.js` to whatever that line recommends. This
+is the one setting where the right value depends entirely on your backend, so
+measure it rather than copying a number.
+
+**`empty.php (POST)` → HTTP 413** means the body limit is below `ulBlobMB`. Raise
+`post_max_size`, or lower `ulBlobMB`.
 
 ## 7. Your result will not equal Ookla's, and that is expected
 
+Read the single-stream numbers the endpoint check gives you. On a shared cPanel
+account roughly 230ms away, a realistic reading looks like:
+
+```
+empty.php (GET)          round trip 230ms
+empty.php (POST 2MB)     ~3.1 Mbps single stream
+garbage.php?ckSize=4     ~27.2 Mbps single stream
+```
+
+Those are ceilings imposed by the server and the distance, not by the client. At
+230ms round trip a single TCP stream is limited by the receive window rather than
+by your line, which is exactly why 3.1 Mbps single-stream upload shows up on a
+line that Ookla measures at 11.5 Mbps.
+
 Ookla picks the nearest server — for a Karachi connection that is a Cybernet box
-a few ms away. Your backend is wherever your hosting is. A ping of ~228ms means
-the server is on another continent, and a shared cPanel account also shares its
-uplink and CPU with other sites.
+a few ms away. Your backend is wherever your hosting is. Shared cPanel also
+shares its uplink and CPU with other sites on the same box.
 
 So the honest comparison is: your tool measures *your line to your server*, Ookla
 measures *your line to the closest server it can find*. To get close to Ookla's

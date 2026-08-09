@@ -26,25 +26,32 @@ export const DEFAULTS = {
   pingCount: 12,
   pingTimeout: 5000,
 
-  dlStreams: 6,
+  dlStreams: 3,
   ulStreams: 3,
 
-  dlDuration: 11000,
-  ulDuration: 11000,
+  dlDuration: 15000,
+  ulDuration: 15000,
 
   // Slow-start window that is measured but NOT counted in the final number.
-  rampUp: 2500,
+  // On a high-latency server the streams need longer before they settle, and on
+  // a host that queues PHP processes this is also the queue draining.
+  rampUp: 4000,
 
   // Start streams one by one instead of all at once (avoids an initial burst
   // that distorts the first samples).
   streamStagger: 250,
 
-  // garbage.php ckSize in MB. Requests are aborted when the phase ends, and a
-  // stream simply asks for the next chunk if it finishes early.
-  // Keep this modest: if PHP output buffering is on, the whole response is held
-  // in memory before the first byte ships, so 1024 blows memory_limit and you
-  // get an instant 500 with zero bytes.
-  dlChunkMB: 50,
+  // garbage.php ckSize in MB, per request. Streams loop, so this is not the
+  // total — it only sets how much each request asks for.
+  // Many hosts (LiteSpeed, cPanel, anything with forced output buffering or a
+  // proxy in front) hold a large response until it is fully generated, so the
+  // first byte never arrives and the phase reads 0.00. The client detects that
+  // and halves the chunk automatically, down to dlChunkMinMB.
+  dlChunkMB: 100,
+  dlChunkMinMB: 2,
+
+  // If no headers come back within this long, the chunk is too big for the host.
+  ttfbTimeout: 4000,
 
   // Size of the random blob POSTed per upload request. Must stay under PHP's
   // post_max_size and the web server's body limit, or every POST is rejected.
@@ -120,6 +127,8 @@ export class SpeedTest {
     this.controllers = [];
     this.xhrs = [];
     this.lastError = null;
+    // Mutable: shrinks itself if the host cannot start sending in time.
+    this.dlChunk = this.cfg.dlChunkMB;
   }
 
   url(file, params = {}) {
@@ -199,44 +208,121 @@ export class SpeedTest {
       line('empty.php (POST)', false, e?.message || 'request failed');
     }
 
-    // 4. garbage.php at the configured size
-    for (const mb of [4, this.cfg.dlChunkMB]) {
+    // 4. garbage.php — climb the ladder until the host stops streaming, so you
+    //    can see exactly how large a chunk it will actually ship.
+    for (const mb of [4, 8, 16, 32, 64]) {
       const controller = new AbortController();
-      const stop = setTimeout(() => controller.abort(), 6000);
+      let ttfbExpired = false;
+      const ttfb = setTimeout(() => { ttfbExpired = true; controller.abort(); }, 5000);
+      const hardStop = setTimeout(() => controller.abort(), 9000);
+      let firstByteAt = null;
       try {
         const t = performance.now();
         const res = await fetch(this.url('garbage.php', { ckSize: String(mb) }), {
           cache: 'no-store',
           signal: controller.signal,
         });
+        clearTimeout(ttfb);
         if (!res.ok) {
-          line(`garbage.php?ckSize=${mb}`, false,
-            `HTTP ${res.status} — PHP is probably buffering the whole ${mb}MB and hitting memory_limit`);
-        } else {
-          const reader = res.body.getReader();
-          let bytes = 0;
-          for (;;) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            bytes += value.byteLength;
-            if (performance.now() - t > 3000) { await reader.cancel(); break; }
-          }
-          const ms = performance.now() - t;
-          const ttfb = bytes > 0 ? '' : ' — headers came back but no body arrived';
-          line(`garbage.php?ckSize=${mb}`, bytes > 0,
-            `HTTP ${res.status}, ${(bytes / 1048576).toFixed(1)}MB in ${Math.round(ms)}ms `
-            + `(~${((bytes * 8) / (ms / 1000) / 1e6).toFixed(1)} Mbps single stream)${ttfb}`);
+          line(`garbage.php?ckSize=${mb}`, false, `HTTP ${res.status}`);
+          break;
         }
+        const reader = res.body.getReader();
+        let bytes = 0;
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (firstByteAt === null) firstByteAt = performance.now() - t;
+          bytes += value.byteLength;
+          if (performance.now() - t > 4000) { await reader.cancel(); break; }
+        }
+        const ms = performance.now() - t;
+        line(`garbage.php?ckSize=${mb}`, bytes > 0,
+          `first byte in ${Math.round(firstByteAt ?? ms)}ms, `
+          + `${(bytes / 1048576).toFixed(1)}MB in ${Math.round(ms)}ms `
+          + `(~${((bytes * 8) / (ms / 1000) / 1e6).toFixed(1)} Mbps single stream)`);
       } catch (e) {
-        line(`garbage.php?ckSize=${mb}`, false, e?.name === 'AbortError'
-          ? 'no response within 6s — the request is being generated or blocked before any bytes ship'
+        clearTimeout(ttfb);
+        line(`garbage.php?ckSize=${mb}`, false, ttfbExpired
+          ? 'no first byte within 5s — the host buffers this size instead of streaming it. '
+            + `Set dlChunkMB below ${mb}.`
           : e?.message || 'request failed');
+        break;
       } finally {
-        clearTimeout(stop);
+        clearTimeout(ttfb);
+        clearTimeout(hardStop);
       }
     }
 
+    // 5. How many parallel streams this server actually likes.
+    const scores = [];
+    for (const n of [1, 2, 4, 6]) {
+      try {
+        const mbps = await this.probeConcurrency(n, 5000);
+        scores.push({ n, mbps });
+        line(`${n} parallel stream${n > 1 ? 's' : ''}`, true, `${mbps.toFixed(1)} Mbps aggregate`);
+      } catch (e) {
+        line(`${n} parallel streams`, false, e?.message || 'probe failed');
+      }
+    }
+    if (scores.length > 1) {
+      const best = scores.reduce((a, b) => (b.mbps > a.mbps ? b : a));
+      const single = scores[0].mbps;
+      line('best concurrency', true, best.mbps > single * 1.15
+        ? `${best.n} streams (${best.mbps.toFixed(1)} Mbps) — set dlStreams to ${best.n}`
+        : `${best.n} stream${best.n > 1 ? 's' : ''} — extra streams do not help here, `
+          + 'the server queues them. Keep dlStreams low.');
+    }
+
     return out;
+  }
+
+  /**
+   * Aggregate throughput with a given number of parallel streams.
+   * On a proper server more streams means more speed. On a shared host that
+   * queues PHP processes, more streams means LESS speed — this is how you find
+   * out which one you have.
+   */
+  async probeConcurrency(streams, ms) {
+    const meter = new Meter(this.cfg.overhead);
+    const ctrls = [];
+    const endsAt = performance.now() + ms;
+
+    const one = async () => {
+      while (performance.now() < endsAt) {
+        const c = new AbortController();
+        ctrls.push(c);
+        try {
+          const res = await fetch(this.url('garbage.php', { ckSize: String(this.cfg.dlChunkMB) }), {
+            cache: 'no-store',
+            signal: c.signal,
+          });
+          if (!res.ok || !res.body) return;
+          const reader = res.body.getReader();
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            meter.add(value.byteLength);
+            if (performance.now() >= endsAt) {
+              try { await reader.cancel(); } catch { /* noop */ }
+              return;
+            }
+          }
+        } catch {
+          return;
+        }
+      }
+    };
+
+    const t0 = performance.now();
+    const jobs = [];
+    for (let i = 0; i < streams; i++) jobs.push(one());
+    await new Promise((r) => setTimeout(r, ms));
+    for (const c of ctrls) { try { c.abort(); } catch { /* noop */ } }
+    await Promise.allSettled(jobs);
+
+    const sec = (performance.now() - t0) / 1000;
+    return (meter.bytes * 8 * this.cfg.overhead) / sec / 1e6;
   }
 
   /* ---------------- ping / jitter ---------------- */
@@ -325,19 +411,30 @@ export class SpeedTest {
       const sep = this.cfg.dlStaticUrl.includes('?') ? '&' : '?';
       return `${this.cfg.dlStaticUrl}${sep}r=${rnd()}`;
     }
-    return this.url('garbage.php', { ckSize: String(this.cfg.dlChunkMB) });
+    return this.url('garbage.php', { ckSize: String(this.dlChunk) });
   }
 
   async downloadStream(meter, endsAt) {
-    const controller = new AbortController();
-    this.controllers.push(controller);
-
     while (!this.stopped && performance.now() < endsAt) {
+      const askedFor = this.dlChunk;
+      const controller = new AbortController();
+      controller.ttfbExpired = false;
+      this.controllers.push(controller);
+
+      // If the host is buffering the whole response, headers never arrive.
+      // Give up on this request and come back with a smaller chunk.
+      const ttfbTimer = setTimeout(() => {
+        controller.ttfbExpired = true;
+        try { controller.abort(); } catch { /* noop */ }
+      }, this.cfg.ttfbTimeout);
+
       try {
         const res = await fetch(this.dlUrl(), {
           cache: 'no-store',
           signal: controller.signal,
         });
+        clearTimeout(ttfbTimer);
+
         if (!res.ok) throw new Error(`garbage.php answered HTTP ${res.status}`);
         if (!res.body) throw new Error('This browser did not give a readable response body.');
 
@@ -353,9 +450,27 @@ export class SpeedTest {
           }
         }
       } catch (err) {
-        if (this.stopped || err?.name === 'AbortError') return;
-        this.lastError = err?.message || String(err);
-        // Transient failure: pause briefly instead of hammering the server.
+        clearTimeout(ttfbTimer);
+        if (this.stopped) return;
+
+        if (controller.ttfbExpired) {
+          // Shrink for every stream, not just this one, then retry immediately.
+          const next = Math.max(this.cfg.dlChunkMinMB, Math.floor(askedFor / 2));
+          if (next < askedFor) {
+            this.dlChunk = next;
+            this.lastError = `garbage.php did not start sending ${askedFor}MB within `
+              + `${(this.cfg.ttfbTimeout / 1000).toFixed(0)}s, so the chunk was reduced to ${next}MB. `
+              + `The host is buffering the response instead of streaming it.`;
+            continue;
+          }
+          this.lastError = `garbage.php did not start sending even ${askedFor}MB within `
+            + `${(this.cfg.ttfbTimeout / 1000).toFixed(0)}s.`;
+        } else if (err?.name === 'AbortError') {
+          return;
+        } else {
+          this.lastError = err?.message || String(err);
+        }
+
         await new Promise((r) => setTimeout(r, 300));
       }
     }
