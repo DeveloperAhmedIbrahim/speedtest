@@ -51,6 +51,7 @@ export default function App() {
   const [failures, setFailures] = useState([]);
   const [checks, setChecks] = useState(null);
   const [checking, setChecking] = useState(false);
+  const [extending, setExtending] = useState(null);
   const [copied, setCopied] = useState(false);
 
   const testRef = useRef(null);
@@ -75,6 +76,7 @@ export default function App() {
     setFailures([]);
     setChecks(null);
     setCopied(false);
+    setExtending(null);
     setPhase('ping');
 
     try {
@@ -83,6 +85,7 @@ export default function App() {
           case 'phase':
             setPhase(ev.phase);
             setInst(0);
+            setExtending(null);
             break;
           case 'ping-progress':
             setLivePing(ev.value);
@@ -96,6 +99,12 @@ export default function App() {
             break;
           case 'phase-failed':
             setFailures((prev) => [...prev, `${ev.phase}: ${ev.message}`]);
+            break;
+          case 'phase-warning':
+            setFailures((prev) => [...prev, ev.message]);
+            break;
+          case 'phase-extended':
+            setExtending(ev.reason);
             break;
           default:
             break;
@@ -135,6 +144,11 @@ export default function App() {
     }
     return { value: '—', unit: 'Mbps', speed: null };
   }, [phase, inst, livePing, results.download]);
+
+  const spans = useMemo(() => {
+    const max = (p) => samples.reduce((m, s) => (s.phase === p && s.t > m ? s.t : m), 0);
+    return { download: max('download') / 1000, upload: max('upload') / 1000 };
+  }, [samples]);
 
   const copy = async () => {
     const text = [
@@ -206,6 +220,9 @@ export default function App() {
         <p className="note__text">
           {CONFIG.dlStreams} download streams · {CONFIG.ulStreams} upload streams · first{' '}
           {(CONFIG.rampUp / 1000).toFixed(1)}s of each phase excluded
+          {spans.download ? ` · download ran ${spans.download.toFixed(0)}s` : ''}
+          {spans.upload ? `, upload ${spans.upload.toFixed(0)}s` : ''}
+          {running && extending ? ` · extending (${extending})` : ''}
         </p>
         <span className="note__actions">
           {phase === 'done' && (

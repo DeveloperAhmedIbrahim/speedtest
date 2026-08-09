@@ -59,7 +59,15 @@ export default function Trace({ samples, rampUp, dlDuration, ulDuration }) {
     const padB = 20;
     const plotW = width - padL - padR;
     const plotH = height - padT - padB;
-    const total = dlDuration + ulDuration;
+
+    // Phases extend themselves on slow or unsettled links, so the axis grows to
+    // fit whatever actually happened rather than clipping the tail off.
+    const maxT = (phase) => samples.reduce(
+      (m, s) => (s.phase === phase && s.t > m ? s.t : m), 0,
+    );
+    const dlSpan = Math.max(dlDuration, maxT('download'));
+    const ulSpan = Math.max(ulDuration, maxT('upload'));
+    const total = dlSpan + ulSpan;
 
     const x = (t) => padL + (t / total) * plotW;
     const y = (mbps) => padT + plotH - scaleFrac(mbps) * plotH;
@@ -116,12 +124,12 @@ export default function Trace({ samples, rampUp, dlDuration, ulDuration }) {
     const hasDl = samples.some((s) => s.phase === 'download');
     const hasUl = samples.some((s) => s.phase === 'upload');
     if (hasDl) hatch(0, rampUp);
-    if (hasUl) hatch(dlDuration, dlDuration + rampUp);
+    if (hasUl) hatch(dlSpan, dlSpan + rampUp);
 
     // ---- phase divider + silkscreen labels
     ctx.beginPath();
-    ctx.moveTo(x(dlDuration), padT);
-    ctx.lineTo(x(dlDuration), padT + plotH);
+    ctx.moveTo(x(dlSpan), padT);
+    ctx.lineTo(x(dlSpan), padT + plotH);
     ctx.strokeStyle = c.rule;
     ctx.lineWidth = 1.5;
     ctx.stroke();
@@ -130,13 +138,13 @@ export default function Trace({ samples, rampUp, dlDuration, ulDuration }) {
     ctx.fillStyle = c.ink2;
     ctx.textAlign = 'left';
     ctx.fillText('DOWNLOAD', x(0) + 4, height - padB + 10);
-    ctx.fillText('UPLOAD', x(dlDuration) + 4, height - padB + 10);
+    ctx.fillText('UPLOAD', x(dlSpan) + 4, height - padB + 10);
 
     // ---- pens
     const drawPen = (phase, color, offset) => {
       const pts = samples
         .filter((s) => s.phase === phase)
-        .map((s) => ({ px: x(offset + Math.min(s.t, phase === 'download' ? dlDuration : ulDuration)), py: y(s.mbps) }));
+        .map((s) => ({ px: x(offset + s.t), py: y(s.mbps) }));
       if (pts.length < 2) return pts;
 
       ctx.save();
@@ -159,7 +167,7 @@ export default function Trace({ samples, rampUp, dlDuration, ulDuration }) {
     };
 
     const dlPts = drawPen('download', c.dn, 0);
-    const ulPts = drawPen('upload', c.up, dlDuration);
+    const ulPts = drawPen('upload', c.up, dlSpan);
 
     // ---- pen head on whichever phase is still writing
     const head = ulPts.length ? { p: ulPts[ulPts.length - 1], color: c.up }

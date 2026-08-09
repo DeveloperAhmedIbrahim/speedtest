@@ -38,10 +38,29 @@ export const DEFAULTS = {
   pingTimeout: 5000,
 
   dlStreams: 3,
-  ulStreams: 6,
+  // Upload deliberately runs FEW streams. Over HTTP/2 or HTTP/3 every stream
+  // shares one connection, so extra streams do not add capacity — they just
+  // split it, and at high latency nothing finishes inside the phase window.
+  // A single stream already reaches the link's upload ceiling.
+  ulStreams: 2,
 
-  dlDuration: 15000,
-  ulDuration: 15000,
+  // Base length of each phase. A phase runs at least this long, then keeps
+  // going until the reading settles — up to the max. Slow links need more time:
+  // the same wobble matters more when fewer bytes have moved, and TCP ramp-up
+  // eats a bigger share of a slow phase.
+  dlDuration: 12000,
+  ulDuration: 12000,
+  dlMaxDuration: 32000,
+  ulMaxDuration: 32000,
+
+  // A phase may stop once BOTH are true:
+  //  - the last 3s agrees with the running average within this tolerance
+  //  - at least this many bytes landed in the counted window
+  // The byte floor is what makes slow links run longer automatically: 8MB takes
+  // 8s at 8 Mbps but under a second at 100 Mbps.
+  stableTolerance: 0.07,
+  minCountedBytes: 8 * 1048576,
+  extendStep: 2000,
 
   // Slow-start window that is measured but NOT counted in the final number.
   // On a high-latency server the streams need longer before they settle, and on
@@ -67,7 +86,9 @@ export const DEFAULTS = {
   // Size of the random blob POSTed per upload request. Must stay under PHP's
   // post_max_size and the web server's body limit — if a POST comes back 413 the
   // client halves this automatically, down to ulBlobMinMB.
-  ulBlobMB: 4,
+  // Small enough that requests complete often, which keeps the measurement
+  // granular and limits how much is lost when the phase ends mid-request.
+  ulBlobMB: 2,
   ulBlobMinMB: 1,
 
   // TCP/IP/Ethernet framing is not visible to JS. We only count HTTP payload
@@ -116,6 +137,23 @@ class Meter {
     return toMbps(last.bytes - ref.bytes, (last.t - ref.t) / 1000, this.overhead);
   }
 
+  /** Bytes that landed after the ramp-up window. */
+  countedBytes(rampUp) {
+    const last = this.marks[this.marks.length - 1];
+    if (last.t <= rampUp) return 0;
+    let ref = this.marks[0];
+    for (const m of this.marks) {
+      if (m.t >= rampUp) { ref = m; break; }
+    }
+    return last.bytes - ref.bytes;
+  }
+
+  /** Whole-phase rate, ignoring the ramp-up split. */
+  overall() {
+    const last = this.marks[this.marks.length - 1];
+    return toMbps(last.bytes, last.t / 1000, this.overhead);
+  }
+
   /** Final number: everything after the ramp-up window. */
   measured(rampUp) {
     const last = this.marks[this.marks.length - 1];
@@ -144,6 +182,8 @@ export class SpeedTest {
     this.dlChunk = this.cfg.dlChunkMB;
     this.ulBlobMB = this.cfg.ulBlobMB;
     this.ulBlob = null;
+    this.ulStats = { completed: 0, failed: 0, lastStatus: null };
+    this.ulResized = false;
   }
 
   /** Endpoint filename for the configured backend. */
@@ -315,9 +355,14 @@ export class SpeedTest {
       }
     }
 
+    // Probes saturate the link, so give it a moment to drain between runs —
+    // otherwise each probe measures the congestion left by the previous one.
+    const settle = () => new Promise((r) => setTimeout(r, 1200));
+
     // 5. How many parallel streams this server actually likes.
     const scores = [];
     for (const n of [1, 3, 6]) {
+      await settle();
       try {
         const mbps = await this.probeConcurrency(n, 8000, 3500);
         scores.push({ n, mbps });
@@ -335,7 +380,75 @@ export class SpeedTest {
           + 'the server queues them. Keep dlStreams low.');
     }
 
+    // 6. Upload under real conditions — the single POST above says nothing
+    //    about whether concurrent uploads survive for a whole phase.
+    for (const n of [1, 2, 4]) {
+      await settle();
+      try {
+        const r = await this.probeUpload(n, 10000, 4000);
+        line(`upload, ${n} stream${n > 1 ? 's' : ''}`, r.completed > 0,
+          `${r.mbps.toFixed(1)} Mbps after warm-up (${r.total.toFixed(1)} Mbps incl. warm-up) · `
+          + `${r.completed} finished, ${r.failed} failed · status ${r.statuses}`);
+      } catch (e) {
+        line(`upload, ${n} streams`, false, e?.message || 'probe failed');
+      }
+    }
+
     return out;
+  }
+
+  /**
+   * Reproduces the real upload phase: N concurrent POSTs for `ms`, reporting
+   * aggregate throughput plus how many requests finished and how many failed.
+   * This is what tells you whether the uploads are slow or simply dying.
+   */
+  async probeUpload(streams, ms, rampMs) {
+    const meter = new Meter(this.cfg.overhead);
+    const blob = this.makeBlob();
+    const blobBytes = this.ulBlobMB * 1048576;
+    const xhrs = [];
+    const endsAt = performance.now() + ms;
+    const stats = { completed: 0, failed: 0, statuses: new Set() };
+
+    const one = () => {
+      if (performance.now() >= endsAt) return;
+      const xhr = new XMLHttpRequest();
+      xhrs.push(xhr);
+      let sent = 0;
+      xhr.open('POST', this.url(this.endpoint('upload')), true);
+      xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+      xhr.upload.onprogress = (e) => { meter.add(e.loaded - sent); sent = e.loaded; };
+      xhr.onload = () => {
+        stats.completed += 1;
+        stats.statuses.add(xhr.status);
+        if (xhr.status < 400 && blobBytes > sent) meter.add(blobBytes - sent);
+        one();
+      };
+      xhr.onerror = () => { stats.failed += 1; setTimeout(one, 300); };
+      xhr.send(blob);
+    };
+
+    for (let i = 0; i < streams; i++) setTimeout(one, i * 150);
+
+    let rampBytes = 0;
+    let rampAt = 0;
+    const rampTimer = setTimeout(() => {
+      rampBytes = meter.bytes;
+      rampAt = performance.now();
+    }, rampMs);
+
+    await new Promise((r) => setTimeout(r, ms));
+    clearTimeout(rampTimer);
+    for (const x of xhrs) { try { x.abort(); } catch { /* noop */ } }
+
+    const sec = rampAt ? (performance.now() - rampAt) / 1000 : ms / 1000;
+    const bytes = rampAt ? meter.bytes - rampBytes : meter.bytes;
+    return {
+      mbps: (bytes * 8 * this.cfg.overhead) / sec / 1e6,
+      total: (meter.bytes * 8 * this.cfg.overhead) / (ms / 1000) / 1e6,
+      ...stats,
+      statuses: [...stats.statuses].join(', ') || 'none',
+    };
   }
 
   /**
@@ -489,8 +602,8 @@ export class SpeedTest {
     return this.url('garbage.php', { ckSize: String(this.dlChunk) }, streamIndex);
   }
 
-  async downloadStream(meter, endsAt, streamIndex = 0) {
-    while (!this.stopped && performance.now() < endsAt) {
+  async downloadStream(meter, deadline, streamIndex = 0) {
+    while (!this.stopped && performance.now() < deadline.at) {
       const askedFor = this.dlChunk;
       const controller = new AbortController();
       controller.ttfbExpired = false;
@@ -519,7 +632,7 @@ export class SpeedTest {
           const { done, value } = await reader.read();
           if (done) break;
           meter.add(value.byteLength);
-          if (this.stopped || performance.now() >= endsAt) {
+          if (this.stopped || performance.now() >= deadline.at) {
             try { await reader.cancel(); } catch { /* noop */ }
             return;
           }
@@ -564,9 +677,11 @@ export class SpeedTest {
     return new Blob(parts, { type: 'application/octet-stream' });
   }
 
-  uploadStream(meter, endsAt, streamIndex = 0) {
+  uploadStream(meter, deadline, streamIndex = 0) {
+    const blobBytes = this.ulBlobMB * 1048576;
+
     const send = () => {
-      if (this.stopped || performance.now() >= endsAt) return;
+      if (this.stopped || performance.now() >= deadline.at) return;
 
       const xhr = new XMLHttpRequest();
       this.xhrs.push(xhr);
@@ -583,6 +698,16 @@ export class SpeedTest {
       };
 
       xhr.onload = () => {
+        this.ulStats.completed += 1;
+        this.ulStats.lastStatus = xhr.status;
+        if (xhr.status < 400) {
+          // Progress events report bytes handed to the socket, and in some
+          // setups (cross-origin, HTTP/3) they under-report or never fire at
+          // all. The request finished, so the whole block did arrive — add
+          // whatever the events missed.
+          const missing = blobBytes - sent;
+          if (missing > 0) meter.add(missing);
+        }
         if (xhr.status === 413) {
           const next = Math.max(this.cfg.ulBlobMinMB, Math.floor(this.ulBlobMB / 2));
           if (next < this.ulBlobMB) {
@@ -599,10 +724,19 @@ export class SpeedTest {
         send();
       };
       xhr.onerror = () => {
-        this.lastError = 'The upload request failed before it finished sending.';
+        this.ulStats.failed += 1;
+        this.lastError = 'The upload request failed before it finished sending '
+          + `(${this.ulStats.failed} failed, ${this.ulStats.completed} completed).`;
         if (!this.stopped) setTimeout(send, 300);
       };
-      xhr.onabort = () => { /* run is over */ };
+      xhr.onabort = () => {
+        // Two things abort an upload: the phase ending, and the block being
+        // resized because it was too big for this link. Only the second one
+        // should start a replacement request.
+        if (this.ulResized && !this.stopped && performance.now() < deadline.at) {
+          setTimeout(send, 0);
+        }
+      };
 
       xhr.send(this.ulBlob);
     };
@@ -611,32 +745,86 @@ export class SpeedTest {
 
   /* ---------------- phase driver ---------------- */
 
-  async runPhase(phase, duration, startStreams, onUpdate) {
-    const meter = new Meter(this.cfg.overhead);
+  async runPhase(phase, baseDuration, maxDuration, startStreams, onUpdate) {
+    const cfg = this.cfg;
+    const meter = new Meter(cfg.overhead);
     const startedAt = performance.now();
-    const endsAt = startedAt + duration;
+
+    // Mutable so the phase can extend itself; the streams read it every loop.
+    const deadline = { at: startedAt + baseDuration };
 
     onUpdate?.({ type: 'phase', phase });
 
-    const running = startStreams(meter, endsAt);
+    const running = startStreams(meter, deadline);
 
     await new Promise((resolve) => {
       const timer = setInterval(() => {
         const mark = meter.tick();
-        const inst = meter.instant(this.cfg.instWindow);
+        const inst = meter.instant(cfg.instWindow);
+
         onUpdate?.({
           type: 'sample',
           phase,
           t: mark.t,
           mbps: inst,
-          counted: mark.t >= this.cfg.rampUp,
-          progress: Math.min(mark.t / duration, 1),
+          counted: mark.t >= cfg.rampUp,
+          progress: Math.min(mark.t / (deadline.at - startedAt), 1),
         });
-        if (this.stopped || performance.now() >= endsAt) {
+
+        // On a very slow link a large block never finishes inside the phase, so
+        // progress events stall against a full socket buffer and the reading
+        // collapses to zero. Shrink the block and try again with smaller ones.
+        if (
+          phase === 'upload'
+          && !this.stopped
+          && mark.t > cfg.rampUp + 4000
+          && this.ulStats.completed === 0
+          && this.ulBlobMB > cfg.ulBlobMinMB
+        ) {
+          this.ulBlobMB = Math.max(cfg.ulBlobMinMB, Math.floor(this.ulBlobMB / 2));
+          this.ulBlob = this.makeBlob(this.ulBlobMB);
+          this.ulResized = true;
+          onUpdate?.({
+            type: 'phase-extended',
+            phase,
+            reason: `slow upload, block reduced to ${this.ulBlobMB}MB`,
+          });
+          for (const x of this.xhrs) { try { x.abort(); } catch { /* noop */ } }
+          this.xhrs = [];
+        }
+
+        const done = this.stopped || performance.now() >= deadline.at;
+
+        if (done && !this.stopped && mark.t < maxDuration) {
+          // Decide whether the reading has settled, or whether this link simply
+          // needs more time. Both conditions have to pass.
+          const running_ = meter.measured(cfg.rampUp);
+          const recent = meter.instant(3000);
+          const spread = running_ > 0.01
+            ? Math.abs(recent - running_) / running_
+            : 1;
+          const enoughBytes = meter.countedBytes(cfg.rampUp) >= cfg.minCountedBytes;
+
+          if (spread > cfg.stableTolerance || !enoughBytes) {
+            deadline.at = Math.min(
+              startedAt + maxDuration,
+              deadline.at + cfg.extendStep,
+            );
+            onUpdate?.({
+              type: 'phase-extended',
+              phase,
+              until: (deadline.at - startedAt) / 1000,
+              reason: !enoughBytes ? 'low throughput' : 'reading still moving',
+            });
+            return;
+          }
+        }
+
+        if (done) {
           clearInterval(timer);
           resolve();
         }
-      }, this.cfg.sampleInterval);
+      }, cfg.sampleInterval);
     });
 
     this.abortPhase();
@@ -649,9 +837,31 @@ export class SpeedTest {
         message: this.lastError
           || `No ${phase} data arrived. Run the endpoint check below to see which request is failing.`,
       });
+      return 0;
     }
 
-    return meter.measured(this.cfg.rampUp);
+    let value = meter.measured(this.cfg.rampUp);
+
+    // Traffic moved, but none of it landed in the counted window — reporting
+    // 0.00 here would be a lie about the connection. Fall back to the whole
+    // phase and say what happened.
+    if (value === 0 && meter.bytes > 0 && !this.stopped) {
+      value = meter.overall();
+      const stats = phase === 'upload'
+        ? ` ${this.ulStats.completed} requests finished, ${this.ulStats.failed} failed`
+          + `${this.ulStats.lastStatus ? `, last status ${this.ulStats.lastStatus}` : ''}.`
+        : '';
+      onUpdate?.({
+        type: 'phase-warning',
+        phase,
+        message: `${phase}: traffic stopped after the first `
+          + `${(this.cfg.rampUp / 1000).toFixed(0)}s, so the counted window was empty. `
+          + `Showing the whole-phase average instead.${stats}`
+          + (this.lastError ? ` Last error: ${this.lastError}` : ''),
+      });
+    }
+
+    return value;
   }
 
   abortPhase() {
@@ -675,28 +885,36 @@ export class SpeedTest {
     onUpdate?.({ type: 'result', key: 'jitter', value: jitter });
     if (this.stopped) return result;
 
-    result.download = await this.runPhase('download', cfg.dlDuration, (meter, endsAt) => {
-      const jobs = [];
-      for (let i = 0; i < cfg.dlStreams; i++) {
-        jobs.push(
-          new Promise((resolve) => setTimeout(resolve, i * cfg.streamStagger))
-            .then(() => (this.stopped ? null : this.downloadStream(meter, endsAt, i)))
-        );
-      }
-      return jobs;
-    }, onUpdate);
+    result.download = await this.runPhase(
+      'download', cfg.dlDuration, cfg.dlMaxDuration,
+      (meter, deadline) => {
+        const jobs = [];
+        for (let i = 0; i < cfg.dlStreams; i++) {
+          jobs.push(
+            new Promise((resolve) => setTimeout(resolve, i * cfg.streamStagger))
+              .then(() => (this.stopped ? null : this.downloadStream(meter, deadline, i)))
+          );
+        }
+        return jobs;
+      },
+      onUpdate,
+    );
     onUpdate?.({ type: 'result', key: 'download', value: result.download });
     if (this.stopped) return result;
 
     this.ulBlob = this.makeBlob();
-    result.upload = await this.runPhase('upload', cfg.ulDuration, (meter, endsAt) => {
-      for (let i = 0; i < cfg.ulStreams; i++) {
-        setTimeout(() => {
-          if (!this.stopped) this.uploadStream(meter, endsAt, i);
-        }, i * cfg.streamStagger);
-      }
-      return [];
-    }, onUpdate);
+    result.upload = await this.runPhase(
+      'upload', cfg.ulDuration, cfg.ulMaxDuration,
+      (meter, deadline) => {
+        for (let i = 0; i < cfg.ulStreams; i++) {
+          setTimeout(() => {
+            if (!this.stopped) this.uploadStream(meter, deadline, i);
+          }, i * cfg.streamStagger);
+        }
+        return [];
+      },
+      onUpdate,
+    );
     onUpdate?.({ type: 'result', key: 'upload', value: result.upload });
 
     onUpdate?.({ type: 'phase', phase: 'done' });
