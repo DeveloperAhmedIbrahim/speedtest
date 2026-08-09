@@ -182,8 +182,16 @@ Set `dlStreams` in `src/lib/speedtest.js` to whatever that line recommends. This
 is the one setting where the right value depends entirely on your backend, so
 measure it rather than copying a number.
 
-**`empty.php (POST)` → HTTP 413** means the body limit is below `ulBlobMB`. Raise
-`post_max_size`, or lower `ulBlobMB`.
+**`empty.php (POST)` → HTTP 413** means the body limit is below `ulBlobMB`. The
+client now halves the block automatically down to `ulBlobMinMB`, but raising
+`post_max_size` lets it use larger blocks and waste fewer round trips.
+
+**`empty.php (POST 2MB)` takes many seconds and upload collapses.** Something in
+`empty.php` is reading the request body. It must not — the web server discards
+the body on its own, and draining `php://input` in PHP is extremely slow on
+LiteSpeed and cPanel (a 2MB POST went from ~2s to ~20s in testing, which dropped
+the measured upload from 12.8 Mbps to 0.84 Mbps). Keep `empty.php` boring: headers
+only, no body handling. Compare yours against `server-patched/empty.php`.
 
 ## 7. Your result will not equal Ookla's, and that is expected
 

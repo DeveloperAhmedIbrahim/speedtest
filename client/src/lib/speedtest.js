@@ -27,7 +27,7 @@ export const DEFAULTS = {
   pingTimeout: 5000,
 
   dlStreams: 3,
-  ulStreams: 3,
+  ulStreams: 4,
 
   dlDuration: 15000,
   ulDuration: 15000,
@@ -54,8 +54,10 @@ export const DEFAULTS = {
   ttfbTimeout: 4000,
 
   // Size of the random blob POSTed per upload request. Must stay under PHP's
-  // post_max_size and the web server's body limit, or every POST is rejected.
-  ulBlobMB: 2,
+  // post_max_size and the web server's body limit — if a POST comes back 413 the
+  // client halves this automatically, down to ulBlobMinMB.
+  ulBlobMB: 4,
+  ulBlobMinMB: 1,
 
   // TCP/IP/Ethernet framing is not visible to JS. We only count HTTP payload
   // bytes, so the wire rate is ~6% higher. Same factor LibreSpeed uses.
@@ -127,8 +129,10 @@ export class SpeedTest {
     this.controllers = [];
     this.xhrs = [];
     this.lastError = null;
-    // Mutable: shrinks itself if the host cannot start sending in time.
+    // Mutable: both shrink themselves if the host rejects the size.
     this.dlChunk = this.cfg.dlChunkMB;
+    this.ulBlobMB = this.cfg.ulBlobMB;
+    this.ulBlob = null;
   }
 
   url(file, params = {}) {
@@ -188,7 +192,7 @@ export class SpeedTest {
 
     // 3. empty.php, POST — the upload path, at the size the test actually uses
     try {
-      const blob = this.makeBlob();
+      const blob = this.makeBlob();  // uses the current ulBlobMB
       const t = performance.now();
       const res = await fetch(this.url('empty.php'), {
         method: 'POST',
@@ -196,13 +200,13 @@ export class SpeedTest {
         headers: { 'Content-Type': 'application/octet-stream' },
       });
       const ms = performance.now() - t;
-      const mbps = (this.cfg.ulBlobMB * 1048576 * 8) / (ms / 1000) / 1e6;
+      const mbps = (this.ulBlobMB * 1048576 * 8) / (ms / 1000) / 1e6;
       line(
-        `empty.php (POST ${this.cfg.ulBlobMB}MB)`,
+        `empty.php (POST ${this.ulBlobMB}MB)`,
         res.ok,
         res.ok
           ? `HTTP ${res.status} in ${Math.round(ms)}ms (~${mbps.toFixed(1)} Mbps single stream)`
-          : `HTTP ${res.status} — body limit is below ${this.cfg.ulBlobMB}MB (post_max_size / client_max_body_size / LimitRequestBody)`,
+          : `HTTP ${res.status} — body limit is below ${this.ulBlobMB}MB (post_max_size / client_max_body_size / LimitRequestBody)`,
       );
     } catch (e) {
       line('empty.php (POST)', false, e?.message || 'request failed');
@@ -234,7 +238,10 @@ export class SpeedTest {
           if (done) break;
           if (firstByteAt === null) firstByteAt = performance.now() - t;
           bytes += value.byteLength;
-          if (performance.now() - t > 4000) { await reader.cancel(); break; }
+          if (performance.now() - t > 4000) {
+            try { await reader.cancel(); } catch { /* noop */ }
+            break;
+          }
         }
         const ms = performance.now() - t;
         line(`garbage.php?ckSize=${mb}`, bytes > 0,
@@ -256,9 +263,9 @@ export class SpeedTest {
 
     // 5. How many parallel streams this server actually likes.
     const scores = [];
-    for (const n of [1, 2, 4, 6]) {
+    for (const n of [1, 3, 6]) {
       try {
-        const mbps = await this.probeConcurrency(n, 5000);
+        const mbps = await this.probeConcurrency(n, 8000, 3500);
         scores.push({ n, mbps });
         line(`${n} parallel stream${n > 1 ? 's' : ''}`, true, `${mbps.toFixed(1)} Mbps aggregate`);
       } catch (e) {
@@ -283,7 +290,7 @@ export class SpeedTest {
    * queues PHP processes, more streams means LESS speed — this is how you find
    * out which one you have.
    */
-  async probeConcurrency(streams, ms) {
+  async probeConcurrency(streams, ms, rampMs) {
     const meter = new Meter(this.cfg.overhead);
     const ctrls = [];
     const endsAt = performance.now() + ms;
@@ -314,15 +321,26 @@ export class SpeedTest {
       }
     };
 
-    const t0 = performance.now();
     const jobs = [];
     for (let i = 0; i < streams; i++) jobs.push(one());
+
+    // Same rule as the real test: skip the ramp, or the probe reads far too low
+    // and tells you to use fewer streams than you should.
+    let rampBytes = 0;
+    let rampAt = 0;
+    const rampTimer = setTimeout(() => {
+      rampBytes = meter.bytes;
+      rampAt = performance.now();
+    }, rampMs);
+
     await new Promise((r) => setTimeout(r, ms));
+    clearTimeout(rampTimer);
     for (const c of ctrls) { try { c.abort(); } catch { /* noop */ } }
     await Promise.allSettled(jobs);
 
-    const sec = (performance.now() - t0) / 1000;
-    return (meter.bytes * 8 * this.cfg.overhead) / sec / 1e6;
+    if (!rampAt) return 0;
+    const sec = (performance.now() - rampAt) / 1000;
+    return ((meter.bytes - rampBytes) * 8 * this.cfg.overhead) / sec / 1e6;
   }
 
   /* ---------------- ping / jitter ---------------- */
@@ -478,18 +496,18 @@ export class SpeedTest {
 
   /* ---------------- upload ---------------- */
 
-  makeBlob() {
+  makeBlob(sizeMB = this.ulBlobMB) {
     const CHUNK = 1048576;
     const chunk = new Uint8Array(CHUNK);
     // Random data so nothing along the path can compress it away.
     for (let i = 0; i < CHUNK; i += 65536) {
       crypto.getRandomValues(chunk.subarray(i, Math.min(i + 65536, CHUNK)));
     }
-    const parts = new Array(this.cfg.ulBlobMB).fill(chunk);
+    const parts = new Array(sizeMB).fill(chunk);
     return new Blob(parts, { type: 'application/octet-stream' });
   }
 
-  uploadStream(meter, endsAt, blob) {
+  uploadStream(meter, endsAt) {
     const send = () => {
       if (this.stopped || performance.now() >= endsAt) return;
 
@@ -508,9 +526,18 @@ export class SpeedTest {
       };
 
       xhr.onload = () => {
-        if (xhr.status >= 400) {
-          this.lastError = `empty.php rejected the upload with HTTP ${xhr.status}`
-            + (xhr.status === 413 ? ' — the body limit is smaller than ulBlobMB' : '');
+        if (xhr.status === 413) {
+          const next = Math.max(this.cfg.ulBlobMinMB, Math.floor(this.ulBlobMB / 2));
+          if (next < this.ulBlobMB) {
+            this.ulBlobMB = next;
+            this.ulBlob = this.makeBlob(next);
+            this.lastError = `empty.php returned 413, so the upload block was reduced `
+              + `to ${next}MB. Raise post_max_size to use larger blocks.`;
+          } else {
+            this.lastError = `empty.php returned 413 even for ${this.ulBlobMB}MB.`;
+          }
+        } else if (xhr.status >= 400) {
+          this.lastError = `empty.php rejected the upload with HTTP ${xhr.status}`;
         }
         send();
       };
@@ -520,7 +547,7 @@ export class SpeedTest {
       };
       xhr.onabort = () => { /* run is over */ };
 
-      xhr.send(blob);
+      xhr.send(this.ulBlob);
     };
     send();
   }
@@ -604,11 +631,11 @@ export class SpeedTest {
     onUpdate?.({ type: 'result', key: 'download', value: result.download });
     if (this.stopped) return result;
 
-    const blob = this.makeBlob();
+    this.ulBlob = this.makeBlob();
     result.upload = await this.runPhase('upload', cfg.ulDuration, (meter, endsAt) => {
       for (let i = 0; i < cfg.ulStreams; i++) {
         setTimeout(() => {
-          if (!this.stopped) this.uploadStream(meter, endsAt, blob);
+          if (!this.stopped) this.uploadStream(meter, endsAt);
         }, i * cfg.streamStagger);
       }
       return [];
