@@ -16,7 +16,7 @@ function token(name, fallback) {
  * pen    — CSS variable name for the active pen colour
  * phase  — 'idle' | 'ping' | 'download' | 'upload' | 'done'
  */
-export default function Dial({ value, unit, speed, pen, phase, label }) {
+export default function Dial({ value, unit, speed, pen, phase, label, theme }) {
   const canvasRef = useRef(null);
   const animRef = useRef({ frac: 0, target: 0, raf: 0, sweep: 0 });
   const [size, setSize] = useState(300);
@@ -107,19 +107,27 @@ export default function Dial({ value, unit, speed, pen, phase, label }) {
       if (phase === 'ping') {
         // no throughput to show yet — a slow sweep says "probing"
         const head = START + ((a.sweep % (Math.PI * 2)) / (Math.PI * 2)) * SWEEP;
+        ctx.save();
+        ctx.shadowColor = colors.active;
+        ctx.shadowBlur = 10;
         ctx.beginPath();
         ctx.arc(cx, cy, r, head, head + 0.45);
         ctx.strokeStyle = colors.active;
         ctx.lineWidth = 6;
         ctx.lineCap = 'butt';
         ctx.stroke();
+        ctx.restore();
       } else if (a.frac > 0.001) {
+        ctx.save();
+        ctx.shadowColor = colors.active;
+        ctx.shadowBlur = 10;
         ctx.beginPath();
         ctx.arc(cx, cy, r, START, START + a.frac * SWEEP);
         ctx.strokeStyle = colors.active;
         ctx.lineWidth = 6;
         ctx.lineCap = 'butt';
         ctx.stroke();
+        ctx.restore();
 
         // pointer: a short mark just inside the arc, so it never crosses the readout
         const ang = START + a.frac * SWEEP;
@@ -137,7 +145,7 @@ export default function Dial({ value, unit, speed, pen, phase, label }) {
 
     draw();
     return () => cancelAnimationFrame(animRef.current.raf);
-  }, [size, pen, phase]);
+  }, [size, pen, phase, theme]);
 
   return (
     <div className="dial">

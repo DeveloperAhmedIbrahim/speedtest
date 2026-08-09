@@ -17,7 +17,7 @@ function rgba(hex, alpha) {
  * the red pen draws upload. The hatched band at the start of each phase is the
  * TCP warm-up — it is drawn, but it is not part of the final number.
  */
-export default function Trace({ samples, rampUp, dlDuration, ulDuration }) {
+export default function Trace({ samples, rampUp, dlDuration, ulDuration, theme }) {
   const wrapRef = useRef(null);
   const canvasRef = useRef(null);
   const [width, setWidth] = useState(680);
@@ -186,7 +186,7 @@ export default function Trace({ samples, rampUp, dlDuration, ulDuration }) {
     ctx.strokeStyle = c.rule;
     ctx.lineWidth = 1;
     ctx.stroke();
-  }, [samples, width, rampUp, dlDuration, ulDuration]);
+  }, [samples, width, rampUp, dlDuration, ulDuration, theme]);
 
   return (
     <div className="trace">

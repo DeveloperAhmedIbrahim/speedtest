@@ -1,0 +1,17 @@
+{
+  "name": "speedtest",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Speed test — React client with a Cloudflare Worker backend",
+  "workspaces": [
+    "client",
+    "worker"
+  ],
+  "scripts": {
+    "dev": "npm run dev --workspace client",
+    "build": "npm run build --workspace client",
+    "preview": "npm run preview --workspace client",
+    "deploy:worker": "npm run deploy --workspace worker",
+    "dev:worker": "npm run dev --workspace worker"
+  }
+}
