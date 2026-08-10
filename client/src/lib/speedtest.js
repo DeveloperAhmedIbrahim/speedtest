@@ -58,7 +58,7 @@ export const DEFAULTS = {
   //  - at least this many bytes landed in the counted window
   // The byte floor is what makes slow links run longer automatically: 8MB takes
   // 8s at 8 Mbps but under a second at 100 Mbps.
-  stableTolerance: 0.07,
+  stableTolerance: 0.12,
   minCountedBytes: 8 * 1048576,
   extendStep: 2000,
 
@@ -344,9 +344,19 @@ export class SpeedTest {
           + `(~${((bytes * 8) / (ms / 1000) / 1e6).toFixed(1)} Mbps single stream)`);
       } catch (e) {
         clearTimeout(ttfb);
+        const smallest = mb === 4;
         line(sizeLabel(mb), false, ttfbExpired
-          ? 'no first byte within 5s — the host buffers this size instead of streaming it. '
-            + `Set dlChunkMB below ${mb}.`
+          ? (smallest
+            // Even the smallest rung stalled. If ping and upload passed, the
+            // server is fine and the path is dropping full-size packets — a
+            // classic MTU / PMTUD blackhole, common on a fresh IPv6 route.
+            ? 'no first byte within 5s, and this is the smallest size tested. If ping '
+              + 'and upload passed above, the server is answering — something on the '
+              + 'path is dropping full-size packets (MTU / PMTUD blackhole). Compare '
+              + '`curl -4` against `curl -6` to the same URL, and try lowering the MTU '
+              + 'or disabling IPv6 to confirm.'
+            : 'no first byte within 5s — the host is buffering this size instead of '
+              + `streaming it. Set dlChunkMB below ${mb}.`)
           : e?.message || 'request failed');
         break;
       } finally {
@@ -603,7 +613,7 @@ export class SpeedTest {
   }
 
   async downloadStream(meter, deadline, streamIndex = 0) {
-    while (!this.stopped && performance.now() < deadline.at) {
+    while (!this.stopped && !deadline.done) {
       const askedFor = this.dlChunk;
       const controller = new AbortController();
       controller.ttfbExpired = false;
@@ -632,7 +642,7 @@ export class SpeedTest {
           const { done, value } = await reader.read();
           if (done) break;
           meter.add(value.byteLength);
-          if (this.stopped || performance.now() >= deadline.at) {
+          if (this.stopped || deadline.done) {
             try { await reader.cancel(); } catch { /* noop */ }
             return;
           }
@@ -681,7 +691,7 @@ export class SpeedTest {
     const blobBytes = this.ulBlobMB * 1048576;
 
     const send = () => {
-      if (this.stopped || performance.now() >= deadline.at) return;
+      if (this.stopped || deadline.done) return;
 
       const xhr = new XMLHttpRequest();
       this.xhrs.push(xhr);
@@ -733,7 +743,7 @@ export class SpeedTest {
         // Two things abort an upload: the phase ending, and the block being
         // resized because it was too big for this link. Only the second one
         // should start a replacement request.
-        if (this.ulResized && !this.stopped && performance.now() < deadline.at) {
+        if (this.ulResized && !this.stopped && !deadline.done) {
           setTimeout(send, 0);
         }
       };
@@ -750,8 +760,11 @@ export class SpeedTest {
     const meter = new Meter(cfg.overhead);
     const startedAt = performance.now();
 
-    // Mutable so the phase can extend itself; the streams read it every loop.
-    const deadline = { at: startedAt + baseDuration };
+    // `at` is only for this loop's own extension decision. Streams watch `done`
+    // instead: comparing against a moving timestamp let a stream exit at the old
+    // deadline microseconds before the phase extended it, and the stream never
+    // came back — the download flatlined while the phase kept running.
+    const deadline = { at: startedAt + baseDuration, done: false };
 
     onUpdate?.({ type: 'phase', phase });
 
@@ -793,9 +806,9 @@ export class SpeedTest {
           this.xhrs = [];
         }
 
-        const done = this.stopped || performance.now() >= deadline.at;
+        const reached = this.stopped || performance.now() >= deadline.at;
 
-        if (done && !this.stopped && mark.t < maxDuration) {
+        if (reached && !this.stopped && mark.t < maxDuration) {
           // Decide whether the reading has settled, or whether this link simply
           // needs more time. Both conditions have to pass.
           const running_ = meter.measured(cfg.rampUp);
@@ -803,9 +816,13 @@ export class SpeedTest {
           const spread = running_ > 0.01
             ? Math.abs(recent - running_) / running_
             : 1;
-          const enoughBytes = meter.countedBytes(cfg.rampUp) >= cfg.minCountedBytes;
+          const counted = meter.countedBytes(cfg.rampUp);
+          const enoughBytes = counted >= cfg.minCountedBytes;
+          // A jittery mobile link may never settle inside the tolerance. Once
+          // plenty of data has moved, the average is trustworthy anyway.
+          const plenty = counted >= cfg.minCountedBytes * 4;
 
-          if (spread > cfg.stableTolerance || !enoughBytes) {
+          if (!plenty && (spread > cfg.stableTolerance || !enoughBytes)) {
             deadline.at = Math.min(
               startedAt + maxDuration,
               deadline.at + cfg.extendStep,
@@ -820,7 +837,8 @@ export class SpeedTest {
           }
         }
 
-        if (done) {
+        if (reached) {
+          deadline.done = true;
           clearInterval(timer);
           resolve();
         }
