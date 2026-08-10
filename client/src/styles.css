@@ -75,6 +75,11 @@ button { font: inherit; color: inherit; }
   outline-offset: 2px;
 }
 
+.brand {
+  display: flex;
+  align-items: center;
+}
+
 /* ---------- shell ---------- */
 
 .shell {

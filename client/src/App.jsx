@@ -55,22 +55,6 @@ function readTheme() {
   return window.matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
 }
 
-/** What this connection is comfortably good for — plain language, no scores. */
-function verdictFor(down, up, ping) {
-  if (!Number.isFinite(down)) return null;
-  const video = down >= 25 ? '4K streaming'
-    : down >= 8 ? 'HD streaming'
-      : down >= 3 ? 'SD streaming'
-        : 'light browsing';
-  const calls = Number.isFinite(up) && up >= 3 && Number.isFinite(ping) && ping < 150
-    ? 'group video calls'
-    : Number.isFinite(up) && up >= 1.5 ? 'one-to-one video calls' : 'voice calls';
-  const gaming = Number.isFinite(ping)
-    ? (ping < 50 ? 'competitive gaming' : ping < 120 ? 'casual gaming' : 'turn-based games')
-    : null;
-  return { video, calls, gaming };
-}
-
 export default function App() {
   const [theme, setTheme] = useState(readTheme);
   const [phase, setPhase] = useState('idle');
@@ -193,10 +177,6 @@ export default function App() {
     return { download: max('download') / 1000, upload: max('upload') / 1000 };
   }, [samples]);
 
-  const verdict = phase === 'done'
-    ? verdictFor(results.download, results.upload, results.ping)
-    : null;
-
   const copy = async () => {
     const text = [
       `Download  ${fmtSpeed(results.download)} Mbps`,
@@ -225,7 +205,10 @@ export default function App() {
   return (
     <main className="shell">
       <header className="rail">
-        <h1 className="wordmark">Speedtest</h1>
+        <div className='brand'>
+          <img src="/logo.png" alt="logo" width={50} />
+          <h1 className="wordmark">Speedtest</h1>
+        </div>
         <div className="rail__right">
           <p className="rail__meta">
             {configured
@@ -326,17 +309,6 @@ export default function App() {
       />
 
       <Readouts results={results} phase={phase} inst={inst} />
-
-      {verdict && (
-        <div className="verdict">
-          <span className="verdict__item"><b>Good for</b>{verdict.video}</span>
-          <span className="verdict__item"><b>Calls</b>{verdict.calls}</span>
-          {verdict.gaming && <span className="verdict__item"><b>Gaming</b>{verdict.gaming}</span>}
-          {finishedAt && (
-            <span className="verdict__item"><b>At</b>{finishedAt.toLocaleTimeString()}</span>
-          )}
-        </div>
-      )}
 
       <div className="note">
         <p className="note__text">
