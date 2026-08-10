@@ -42,7 +42,7 @@ export const DEFAULTS = {
   // shares one connection, so extra streams do not add capacity — they just
   // split it, and at high latency nothing finishes inside the phase window.
   // A single stream already reaches the link's upload ceiling.
-  ulStreams: 2,
+  ulStreams: 3,
 
   // Base length of each phase. A phase runs at least this long, then keeps
   // going until the reading settles — up to the max. Slow links need more time:
@@ -420,25 +420,43 @@ export class SpeedTest {
     const endsAt = performance.now() + ms;
     const stats = { completed: 0, failed: 0, statuses: new Set() };
 
-    const one = () => {
-      if (performance.now() >= endsAt) return;
-      const xhr = new XMLHttpRequest();
-      xhrs.push(xhr);
-      let sent = 0;
-      xhr.open('POST', this.url(this.endpoint('upload')), true);
-      xhr.setRequestHeader('Content-Type', 'application/octet-stream');
-      xhr.upload.onprogress = (e) => { meter.add(e.loaded - sent); sent = e.loaded; };
-      xhr.onload = () => {
-        stats.completed += 1;
-        stats.statuses.add(xhr.status);
-        if (xhr.status < 400 && blobBytes > sent) meter.add(blobBytes - sent);
-        one();
+    // Same bounded pump as the real phase, so the probe measures what the test
+    // actually does — and cannot run away and hang the tab either.
+    const MAX_INFLIGHT = 2;
+
+    const makeStream = () => {
+      let inflight = 0;
+      const startOne = () => {
+        const xhr = new XMLHttpRequest();
+        xhrs.push(xhr);
+        inflight += 1;
+        let sent = 0;
+        let settled = false;
+        const release = () => { if (!settled) { settled = true; inflight -= 1; } };
+
+        xhr.open('POST', this.url(this.endpoint('upload')), true);
+        xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+        xhr.upload.onprogress = (e) => { meter.add(e.loaded - sent); sent = e.loaded; };
+        xhr.upload.onloadend = () => pump();
+        xhr.onload = () => {
+          stats.completed += 1;
+          stats.statuses.add(xhr.status);
+          if (xhr.status < 400 && blobBytes > sent) meter.add(blobBytes - sent);
+          release();
+          pump();
+        };
+        xhr.onerror = () => { stats.failed += 1; release(); setTimeout(pump, 300); };
+        xhr.onabort = () => release();
+        xhr.send(blob);
       };
-      xhr.onerror = () => { stats.failed += 1; setTimeout(one, 300); };
-      xhr.send(blob);
+      const pump = () => {
+        if (performance.now() >= endsAt) return;
+        while (inflight < MAX_INFLIGHT) startOne();
+      };
+      pump();
     };
 
-    for (let i = 0; i < streams; i++) setTimeout(one, i * 150);
+    for (let i = 0; i < streams; i++) setTimeout(makeStream, i * 150);
 
     let rampBytes = 0;
     let rampAt = 0;
@@ -690,67 +708,96 @@ export class SpeedTest {
   uploadStream(meter, deadline, streamIndex = 0) {
     const blobBytes = this.ulBlobMB * 1048576;
 
-    const send = () => {
-      if (this.stopped || deadline.done) return;
+    // Overlapping requests keep the pipe busy: waiting for the server's response
+    // before starting the next one costs a full round trip with nothing being
+    // sent. But `upload.onloadend` only means "the socket buffer took it all",
+    // which on an empty buffer fires almost immediately — so without a cap the
+    // stream spawns requests as fast as the buffer accepts them and the tab dies.
+    // At most MAX_INFLIGHT requests per stream are alive at once.
+    const MAX_INFLIGHT = 2;
+    let inflight = 0;
 
+    const startOne = () => {
       const xhr = new XMLHttpRequest();
       this.xhrs.push(xhr);
+      inflight += 1;
+
       let sent = 0;
+      let settled = false;
+
+      const release = () => {
+        if (settled) return;
+        settled = true;
+        inflight -= 1;
+        const i = this.xhrs.indexOf(xhr);
+        if (i !== -1) this.xhrs.splice(i, 1);
+      };
 
       xhr.open('POST', this.url(this.endpoint('upload'), {}, streamIndex), true);
       xhr.setRequestHeader('Content-Type', 'application/octet-stream');
 
-      // THE FIX: e.loaded is cumulative for this request. Count the delta.
+      // e.loaded is cumulative for this request, so count the delta. Summing
+      // e.loaded itself inflates the result by roughly 2.5x.
       xhr.upload.onprogress = (e) => {
         const delta = e.loaded - sent;
         sent = e.loaded;
         meter.add(delta);
       };
 
+      // Body handed over — there may be room to start the next one.
+      xhr.upload.onloadend = () => pump();
+
       xhr.onload = () => {
         this.ulStats.completed += 1;
         this.ulStats.lastStatus = xhr.status;
+
         if (xhr.status < 400) {
-          // Progress events report bytes handed to the socket, and in some
-          // setups (cross-origin, HTTP/3) they under-report or never fire at
-          // all. The request finished, so the whole block did arrive — add
-          // whatever the events missed.
+          // Progress events under-report on some cross-origin and HTTP/3 setups,
+          // and sometimes never fire at all. The request finished, so the whole
+          // block did arrive — add whatever the events missed.
           const missing = blobBytes - sent;
           if (missing > 0) meter.add(missing);
-        }
-        if (xhr.status === 413) {
+        } else if (xhr.status === 413) {
           const next = Math.max(this.cfg.ulBlobMinMB, Math.floor(this.ulBlobMB / 2));
           if (next < this.ulBlobMB) {
             this.ulBlobMB = next;
             this.ulBlob = this.makeBlob(next);
-            this.lastError = `${this.endpoint('upload')} returned 413, so the upload block was reduced `
-              + `to ${next}MB. Raise post_max_size to use larger blocks.`;
+            this.lastError = `${this.endpoint('upload')} returned 413, so the upload `
+              + `block was reduced to ${next}MB. Raise post_max_size for larger blocks.`;
           } else {
             this.lastError = `${this.endpoint('upload')} returned 413 even for ${this.ulBlobMB}MB.`;
           }
-        } else if (xhr.status >= 400) {
+        } else {
           this.lastError = `${this.endpoint('upload')} rejected the upload with HTTP ${xhr.status}`;
         }
-        send();
+
+        release();
+        pump();
       };
+
       xhr.onerror = () => {
         this.ulStats.failed += 1;
         this.lastError = 'The upload request failed before it finished sending '
           + `(${this.ulStats.failed} failed, ${this.ulStats.completed} completed).`;
-        if (!this.stopped) setTimeout(send, 300);
+        release();
+        setTimeout(pump, 300);
       };
+
       xhr.onabort = () => {
-        // Two things abort an upload: the phase ending, and the block being
-        // resized because it was too big for this link. Only the second one
-        // should start a replacement request.
-        if (this.ulResized && !this.stopped && !deadline.done) {
-          setTimeout(send, 0);
-        }
+        release();
+        // Only a block resize aborts mid-phase; the phase ending sets done first.
+        if (this.ulResized && !this.stopped && !deadline.done) setTimeout(pump, 0);
       };
 
       xhr.send(this.ulBlob);
     };
-    send();
+
+    const pump = () => {
+      if (this.stopped || deadline.done) return;
+      while (inflight < MAX_INFLIGHT) startOne();
+    };
+
+    pump();
   }
 
   /* ---------------- phase driver ---------------- */
